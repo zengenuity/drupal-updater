@@ -271,22 +271,132 @@ Update includes:
    */
   protected function checkPackages() {
     if ($this->onlySecurity) {
-      $packages_to_update = $this->runCommand(sprintf('composer audit --locked %s --format plain 2>&1 | grep ^Package | cut -f2 -d: | sort -u', $this->getNoDevParameter()))->getOutput();
-    }
-    else {
-      $packages_to_update = $this->runCommand(sprintf('composer show --locked --direct --name-only %s 2>/dev/null', $this->getNoDevParameter()))
+      $package_list = $this
+        ->runCommand(sprintf('composer audit --locked %s --format plain 2>&1 | grep ^Package | cut -f2 -d: | sort -u', $this->getNoDevParameter()))
         ->getOutput();
     }
-
-    $this->packagesToUpdate = explode("\n", $packages_to_update);
-    $this->packagesToUpdate = array_map(function ($package) {
-      return trim($package);
-    }, $this->packagesToUpdate);
-    $this->packagesToUpdate = array_filter($this->packagesToUpdate, function ($package) {
-      return preg_match('/^([A-Za-z0-9_-]*\/[A-Za-z0-9_-]*)/', $package);
-    });
+    else {
+      $package_list = $this
+        ->runCommand(sprintf('composer show --locked --outdated --name-only %s 2>/dev/null', $this->getNoDevParameter()))
+        ->getOutput();
+    }
+    $package_list_massaged = $this->massagePackageList($package_list);
+    $this->packagesToUpdate = $this->findDirectPackagesFromList($package_list_massaged);
 
     $this->output->writeln(implode("\n", $this->packagesToUpdate));
+  }
+
+  /**
+   * Given a list of packages , find its direct packages.
+   *
+   * @see UpdaterCommand::findDirectPackage()
+   *
+   * @param array $packages_list
+   *   Packages list.
+   * @return array
+   *   List of direct packages.
+   */
+  protected function findDirectPackagesFromList(array $packages_list) {
+    if (empty($packages_list)) {
+      return [];
+    }
+
+    $direct_packages = $this->massagePackageList($this
+      ->runCommand(sprintf('composer show --locked --direct --name-only %s 2>/dev/null', $this->getNoDevParameter()))
+      ->getOutput());
+
+    $direct_packages_found = array_intersect($packages_list, $direct_packages);
+
+    $not_direct_packages = array_diff($packages_list, $direct_packages);
+
+    foreach ($not_direct_packages as $package) {
+      $direct_packages_found[] = $this->findDirectPackage($package, $direct_packages);
+    }
+
+    return array_unique($direct_packages_found);
+  }
+
+  /**
+   * Find the direct package for a specific not direct dependency.
+   *
+   * If no direct package is found, consider the self package as direct. It is a extreme use
+   * case where a too deep dependency is not found. For module convenience, it is needed to consider
+   * package as direct so it can be updated.
+   *
+   * @param string $package
+   *   Package.
+   * @param array $direct_packages
+   *   List of direct packages.
+   *
+   * @return string
+   *   The direct package.
+   */
+  protected function findDirectPackage(string $package, array $direct_packages) {
+    $composer_why_recursive_timeout = 2;
+    $commands = [
+      sprintf("composer why %s --locked | awk '{print $1}'", $package),
+      sprintf("timeout %s composer why %s --locked -r | awk '{print $1}'", $composer_why_recursive_timeout, $package),
+    ];
+
+    foreach ($commands as $command) {
+      $direct_package = $this->findPackageInPackageListCommand($command, $direct_packages);
+      if (!empty($direct_package)) {
+        return $direct_package;
+      }
+    }
+
+    return $package;
+  }
+
+  /**
+   * Finds a package from a command that is present in a package list command.
+   *
+   * This is used to get direct apckages from not direct packages.
+   *
+   * @see UpdaterCommand::findDirectPackage()
+   *
+   * @param string $command
+   *   List that return packages list.
+   * @param array $package_list
+   *   List of packages we want to look for.
+   *
+   * @return string|null
+   *   FIrst package from command that is present in package list.
+   */
+  protected function findPackageInPackageListCommand(string $command, array $package_list) {
+    $package_list_output = array_filter(explode("\n", (string) trim($this->runCommand($command)
+      ->getOutput())));
+    foreach ($package_list_output as $package) {
+      if (in_array($package, $package_list)) {
+        return $package;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Masssages a list of packages.
+   *
+   * It converts a package list bash output into a package list array,
+   * removing any element that is not a package and removing spaces.
+   *
+   * @param string $package_list
+   *   List of packages coming from a bash command (s.e.: composer show --names-only).
+   *
+   * @return array
+   *   List of packages. Example:
+   *    - metadrop/drupal-updater
+   *    - metadrop/drupal-artifact-builder
+   */
+  protected function massagePackageList(string $package_list) {
+    $package_list = explode("\n", $package_list);
+    $package_list = array_map(function ($package) {
+      return trim($package);
+    }, $package_list);
+    return array_filter($package_list, function ($package) {
+      return preg_match('/^([A-Za-z0-9_-]*\/[A-Za-z0-9_-]*)/', $package);
+    });
   }
 
   /**
